@@ -1,0 +1,73 @@
+mode:
+  shard_strategy: global
+  enable_combined_ticks: false
+
+exchanges:
+  - name: hyperliquid
+    kind: hyperliquid
+    network: mainnet
+    subscriptions:
+      books: ["@107", "BTC"]
+      trades: ["HYPE"]
+    options:
+      ping_interval_ms: 15000
+      read_timeout_ms: 30000
+      max_message_bytes: 1048576
+
+# Deribit kept at top-level (matches your AppConfig.deribit)
+deribit:
+  ws_url: "wss://www.deribit.com/ws/api/v2"
+  books: ["BTC-PERPETUAL", "ETH-PERPETUAL"]
+  trades: ["BTC-PERPETUAL"]
+  client_id: ""
+  client_secret: ""
+  private: false
+
+# <-- Add this to satisfy AppConfig
+combiners: []
+
+mmap:
+  path: ./data/global.mm
+  bytes: 1073741824
+  mode: ring
+  format: bincode
+  header:
+    magic: "MDLG"
+    version: 1
+    embed_catalog: true
+  flush:
+    bytes: 1048576
+    interval_ms: 500
+  channel:
+    bound_records: 100000
+    on_overflow: drop_oldest
+
+reconnect:
+  base_delay_ms: 500
+  max_delay_ms: 30000
+  jitter: 0.20
+  heartbeat_ms: 15000
+  read_idle_timeout_ms: 30000
+  reset_backoff_after_ms: 60000
+
+secrets:
+  private_keys: []
+  api_keys: []
+
+logging:
+  path: ./logs/consolidator.log
+  level: debug
+  format: text
+  also_stdout: true
+
+catalog:
+  sources:
+    - { id: 1, name: hyperliquid, network: mainnet }
+    - { id: 2, name: deribit, network: mainnet }
+  instruments:
+    - { id: 1001, exchange: hyperliquid, symbol: "@107", channel: book }
+    - { id: 1002, exchange: hyperliquid, symbol: "BTC", channel: book }
+    - { id: 1003, exchange: hyperliquid, symbol: "HYPE", channel: trades }
+    - { id: 2001, exchange: deribit, symbol: "BTC-PERPETUAL", channel: book }
+    - { id: 2002, exchange: deribit, symbol: "ETH-PERPETUAL", channel: book }
+    - { id: 2003, exchange: deribit, symbol: "BTC-PERPETUAL", channel: trades }
