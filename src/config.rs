@@ -1,6 +1,31 @@
+// src/config.rs
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BinanceSources {
+    pub ws_url: String,
+    #[serde(default)]
+    pub books: Vec<String>,
+    #[serde(default)]
+    pub trades: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeribitSources {
+    pub ws_url: String,
+    #[serde(default)]
+    pub books: Vec<String>,
+    #[serde(default)]
+    pub trades: Vec<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub private: Option<bool>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -15,22 +40,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub catalog: Catalog,
     #[serde(default)]
-    pub deribit: Option<DeribitSources>, // <-- add this
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeribitSources {
-    pub ws_url: String,
+    pub deribit: Option<DeribitSources>,
     #[serde(default)]
-    pub books: Vec<String>,
-    #[serde(default)]
-    pub trades: Vec<String>,
-    #[serde(default)]
-    pub client_id: Option<String>,
-    #[serde(default)]
-    pub client_secret: Option<String>,
-    #[serde(default)]
-    pub private: Option<bool>,
+    pub binance: Option<BinanceSources>,
 }
 
 impl AppConfig {

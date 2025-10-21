@@ -5,6 +5,9 @@
 //   node reader.js --show=trades --exchange=deribit --symbol=BTC-PERPETUAL --pretty ./data/global.mm
 //
 // show options: trades | books | combined | gob | gobjson | both | all | none
+// This reader tries bincode decodes first (matching the Rust writer) and falls back to
+// JSON parsing (Binance/Deribit-friendly) when decoding fails. Filters are case-insensitive
+// and symbols are normalized for flexible matching.
 
 const fs = require("fs");
 const mmap = require("@riaskov/mmap-io"); // npm i @riaskov/mmap-io
@@ -21,8 +24,8 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith("--show=")) SHOW = a.split("=")[1];
   else if (a === "--pretty") PRETTY = true;
-  else if (a.startsWith("--exchange=")) FILTER_EXCHANGE = a.split("=")[1];
-  else if (a.startsWith("--symbol=")) FILTER_SYMBOL = a.split("=")[1];
+  else if (a.startsWith("--exchange=")) FILTER_EXCHANGE = argv[i].split("=")[1];
+  else if (a.startsWith("--symbol=")) FILTER_SYMBOL = argv[i].split("=")[1];
   else if (!a.startsWith("-") && i === argv.length - 1) FILE_PATH = a;
 }
 
@@ -238,6 +241,157 @@ function findAsciiSubstrings(payload) {
   return res;
 }
 
+/* --- Helpers for resilient JSON parsing (Binance/Deribit-friendly) --- */
+
+function tryParseJson(buf) {
+  try {
+    const s = buf.toString("utf8");
+    return JSON.parse(s);
+  } catch (e) {
+    return null;
+  }
+}
+
+function normalizeExchangeName(s) {
+  if (!s) return null;
+  return String(s).trim().toLowerCase();
+}
+function normalizeSymbol(s) {
+  if (!s) return null;
+  return String(s)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+/**
+ * Attempt to extract a trade-like object from arbitrary JSON.
+ * Looks for Binance p/q or generic price/qty fields.
+ */
+function tryParseJsonToTrade(buf) {
+  const js = tryParseJson(buf);
+  if (!js) return null;
+
+  // Deribit subscription payload wrapping (common)
+  // Deribit combined: { "jsonrpc":"2.0","method":"subscription","params":{ "channel":"book.X", "data":{...}}}
+  const core =
+    js.params && js.params.data ? js.params.data : js.data ? js.data : js;
+
+  let px = null,
+    sz = null,
+    side = null,
+    ts = null,
+    exchange = null,
+    symbol = null;
+
+  if ("p" in core) px = Number(core.p);
+  if ("price" in core) px = Number(core.price);
+  if ("price" in core && typeof core.price === "string")
+    px = Number(core.price);
+
+  if ("q" in core) sz = Number(core.q);
+  if ("qty" in core) sz = Number(core.qty);
+  if ("size" in core) sz = Number(core.size);
+  if ("quantity" in core) sz = Number(core.quantity);
+
+  // Binance: "m" boolean (is buyer maker) — map to side conservatively
+  if ("m" in core && typeof core.m === "boolean") {
+    side = core.m === false ? "Buy" : "Sell"; // common mapping
+  }
+  if ("side" in core) side = String(core.side);
+  if ("S" in core)
+    side =
+      core.S === "BUY" ? "Buy" : core.S === "SELL" ? "Sell" : String(core.S);
+
+  // timestamps
+  if ("E" in core) ts = Number(core.E);
+  if ("T" in core) ts = Number(core.T);
+  if ("ts" in core) ts = Number(core.ts);
+  if ("timestamp" in core) ts = Number(core.timestamp);
+  if ("time" in core) ts = Number(core.time);
+
+  // symbol/exchange
+  if ("s" in core) symbol = core.s;
+  if ("symbol" in core) symbol = core.symbol;
+  if ("instrument_name" in core) symbol = core.instrument_name;
+  if ("exchange" in core) exchange = core.exchange;
+  if ("e" in core && !exchange) exchange = core.e;
+
+  if (Number.isFinite(px) && Number.isFinite(sz)) {
+    return {
+      exchange: exchange ? String(exchange) : null,
+      asset: symbol ? String(symbol) : null,
+      px,
+      sz,
+      side: side || null,
+      ts_ms: Number.isFinite(ts) ? ts : null,
+      raw: core,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Attempt to extract a book-like object from arbitrary JSON.
+ */
+function tryParseJsonToBook(buf) {
+  const js = tryParseJson(buf);
+  if (!js) return null;
+
+  const core =
+    js.params && js.params.data ? js.params.data : js.data ? js.data : js;
+
+  let bid = null,
+    ask = null,
+    mid = null,
+    ts = null,
+    exchange = null,
+    symbol = null;
+
+  if ("b" in core) bid = Number(core.b);
+  if ("a" in core) ask = Number(core.a);
+
+  if (Array.isArray(core.bids) && core.bids.length > 0) {
+    const first = core.bids[0];
+    if (Array.isArray(first)) bid = Number(first[0]);
+    else if (typeof first === "object" && "price" in first)
+      bid = Number(first.price);
+  }
+  if (Array.isArray(core.asks) && core.asks.length > 0) {
+    const first = core.asks[0];
+    if (Array.isArray(first)) ask = Number(first[0]);
+    else if (typeof first === "object" && "price" in first)
+      ask = Number(first.price);
+  }
+
+  if ("bestBid" in core) bid = Number(core.bestBid);
+  if ("bestAsk" in core) ask = Number(core.bestAsk);
+
+  if ("timestamp" in core) ts = Number(core.timestamp);
+  if ("E" in core) ts = Number(core.E);
+  if ("T" in core) ts = Number(core.T);
+  if ("ts" in core) ts = Number(core.ts);
+
+  if ("s" in core) symbol = core.s;
+  if ("symbol" in core) symbol = core.symbol;
+  if ("instrument_name" in core) symbol = core.instrument_name;
+  if ("exchange" in core) exchange = core.exchange;
+
+  if (Number.isFinite(bid) && Number.isFinite(ask)) {
+    mid = (bid + ask) / 2.0;
+    return {
+      exchange: exchange ? String(exchange) : null,
+      asset: symbol ? String(symbol) : null,
+      bid,
+      ask,
+      mid,
+      ts_ms: Number.isFinite(ts) ? ts : null,
+      raw: core,
+    };
+  }
+  return null;
+}
+
 /* main */
 (function main() {
   const fd = fs.openSync(FILE_PATH, "r");
@@ -259,6 +413,14 @@ function findAsciiSubstrings(payload) {
   console.log(
     `[mmap-reader] SHOW=${SHOW} PRETTY=${PRETTY} EXCHANGE=${FILTER_EXCHANGE || "<any>"} SYMBOL=${FILTER_SYMBOL || "<any>"}`,
   );
+
+  // normalize filters for robust matching:
+  const normFilterExchange = FILTER_EXCHANGE
+    ? normalizeExchangeName(FILTER_EXCHANGE)
+    : null;
+  const normFilterSymbol = FILTER_SYMBOL
+    ? normalizeSymbol(FILTER_SYMBOL)
+    : null;
 
   function shouldPrint(typeKey, decoded) {
     if (SHOW === "none") return false;
@@ -283,32 +445,49 @@ function findAsciiSubstrings(payload) {
 
   function passesFilters(decoded) {
     if (!decoded) return true;
-    if (FILTER_EXCHANGE) {
-      const ex =
-        decoded.exchange ||
-        (decoded.spot && decoded.spot.exchange) ||
-        (decoded.fut && decoded.fut.exchange) ||
-        (decoded.data && decoded.data.exchange) ||
-        null;
-      if (ex && ex !== FILTER_EXCHANGE) return false;
-      if (!ex) {
+
+    // find exchange & symbol in various plausible places
+    let ex =
+      decoded.exchange ||
+      (decoded.spot && decoded.spot.exchange) ||
+      (decoded.fut && decoded.fut.exchange) ||
+      (decoded.data && decoded.data.exchange) ||
+      (decoded.raw && decoded.raw.exchange) ||
+      null;
+    let asset =
+      decoded.asset ||
+      decoded.symbol ||
+      (decoded.spot && decoded.spot.asset) ||
+      (decoded.fut && decoded.fut.asset) ||
+      (decoded.data && decoded.data.asset) ||
+      (decoded.raw &&
+        (decoded.raw.s || decoded.raw.symbol || decoded.raw.instrument_name)) ||
+      null;
+
+    if (normFilterExchange) {
+      if (ex) {
+        if (normalizeExchangeName(ex) !== normFilterExchange) return false;
+      } else {
         const joined = JSON.stringify(decoded);
-        if (!joined.includes(FILTER_EXCHANGE)) return false;
+        if (!joined.toLowerCase().includes(normFilterExchange)) return false;
       }
     }
-    if (FILTER_SYMBOL) {
-      const asset =
-        decoded.asset ||
-        decoded.symbol ||
-        (decoded.spot && decoded.spot.asset) ||
-        (decoded.fut && decoded.fut.asset) ||
-        (decoded.data && decoded.data.asset);
-      if (asset && asset !== FILTER_SYMBOL) return false;
-      if (!asset) {
+
+    if (normFilterSymbol) {
+      if (asset) {
+        if (normalizeSymbol(asset) !== normFilterSymbol) return false;
+      } else {
         const joined = JSON.stringify(decoded);
-        if (!joined.includes(FILTER_SYMBOL)) return false;
+        if (
+          !joined
+            .toUpperCase()
+            .replace(/[^A-Z0-9]/g, "")
+            .includes(normFilterSymbol)
+        )
+          return false;
       }
     }
+
     return true;
   }
 
@@ -351,11 +530,15 @@ function findAsciiSubstrings(payload) {
 
       try {
         if (rtype === 2) {
+          // Trade
           let decoded;
           try {
             decoded = decodeTradePrint(payload);
           } catch (e) {
-            decoded = { decode_error: e.message };
+            // fallback to JSON parsing (Binance/Deribit-friendly)
+            const alt = tryParseJsonToTrade(payload);
+            if (alt) decoded = alt;
+            else decoded = { decode_error: e.message };
           }
           if (shouldPrint("trade", decoded) && passesFilters(decoded)) {
             output({
@@ -370,11 +553,14 @@ function findAsciiSubstrings(payload) {
             });
           }
         } else if (rtype === 1) {
+          // Book snapshot
           let decoded;
           try {
             decoded = decodeBookSnapshot(payload);
           } catch (e) {
-            decoded = { decode_error: e.message };
+            const alt = tryParseJsonToBook(payload);
+            if (alt) decoded = alt;
+            else decoded = { decode_error: e.message };
           }
           if (shouldPrint("book", decoded) && passesFilters(decoded)) {
             output({
@@ -389,6 +575,7 @@ function findAsciiSubstrings(payload) {
             });
           }
         } else if (rtype === 3) {
+          // CombinedTick
           let decoded;
           try {
             decoded = decodeCombinedTick(payload);
@@ -408,6 +595,7 @@ function findAsciiSubstrings(payload) {
             });
           }
         } else if (rtype === 5) {
+          // GlobalOrderBookJson
           try {
             const txt = payload.toString("utf8");
             const js = JSON.parse(txt);

@@ -387,6 +387,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fd1289c04a9ea8cb22300a459a72a385d7c73d3259e2ed7dcb2af674838cfa9"
 
 [[package]]
+name = "chron"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "902a6b86f517bf4c50564bfd1b3d035a58054c4c1fc6ffcbaa8eb016672fc0eb"
+
+[[package]]
 name = "chrono"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -516,6 +522,8 @@ dependencies = [
  "bincode",
  "byteorder",
  "bytes",
+ "chron",
+ "chrono",
  "clap",
  "futures",
  "futures-util",
@@ -532,6 +540,7 @@ dependencies = [
  "tokio-tungstenite 0.21.0",
  "tracing",
  "tracing-appender",
+ "tracing-log",
  "tracing-subscriber",
 ]
 

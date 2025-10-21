@@ -1,3 +1,4 @@
+// main.rs
 mod aggregator;
 mod auth;
 mod config;
@@ -8,6 +9,7 @@ mod order_book; // HL feeds
 mod router;
 mod shutdown;
 mod sinks; // channel sinks → writer
+mod sources_binance; // <-- new Binance source module
 mod sources_deribit;
 mod sources_hl; // hyperliquid source spawner
 mod types;
@@ -22,6 +24,7 @@ use crate::config::AppConfig;
 use crate::logger::init_logger;
 use crate::mmap_writer::{GlobalWriter, WriterMsg};
 use crate::sinks::{spawn_snapshot_sink, spawn_trade_sink};
+use crate::sources_binance::spawn_binance_from_config; // <-- import spawn fn
 use crate::sources_deribit::spawn_deribit_from_config;
 use crate::sources_hl::spawn_hl_from_config;
 use crate::types::{CombinedTick, OrderBookSnapshot, TradePrint};
@@ -111,6 +114,12 @@ async fn main() -> Result<()> {
     // 5) Spawn Deribit feeds if configured - also point at inbound senders
     if let Some(der_cfg) = &cfg.deribit {
         spawn_deribit_from_config(der_cfg, tx_snap_in.clone(), tx_tr_in.clone()).await?;
+    }
+
+    // 5b) Spawn Binance feeds if configured - also point at inbound senders
+    if let Some(bin_cfg) = &cfg.binance {
+        // spawn_binance_from_config is expected to spawn its own tasks and return quickly.
+        spawn_binance_from_config(&cfg, bin_cfg, tx_snap_in.clone(), tx_tr_in.clone()).await?;
     }
 
     // 6) Attach sinks → writer (sink receivers)

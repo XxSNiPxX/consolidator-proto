@@ -30,6 +30,9 @@ hyperliquid_rust_sdk = { version = "0.5", default-features = false } # adjust ve
 # Websocket / TLS for Deribit adapter
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 futures = "0.3.31"
+chron = "0.1.6"
+chrono = "0.4.42"
+tracing-log = "0.2.0"
 
 # Optional useful utils (uncomment if you want)
 # anyhow = "1"
