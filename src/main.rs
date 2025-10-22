@@ -1,4 +1,4 @@
-// main.rs
+// src/main.rs
 mod aggregator;
 mod auth;
 mod config;
@@ -27,7 +27,7 @@ use crate::sinks::{spawn_snapshot_sink, spawn_trade_sink};
 use crate::sources_binance::spawn_binance_from_config; // <-- import spawn fn
 use crate::sources_deribit::spawn_deribit_from_config;
 use crate::sources_hl::spawn_hl_from_config;
-use crate::types::{CombinedTick, OrderBookSnapshot, TradePrint};
+use crate::types::{OrderBookSnapshot, TradePrint};
 
 #[derive(Parser, Debug)]
 #[command(name = "consolidator-proto")]
@@ -56,18 +56,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ---------------------
-    // Snapshot/Trade channel topology:
-    //
-    // sources -> tx_snap_in/tx_tr_in (single inbound senders)
-    //                 v
-    //           duplicator tasks
-    //         /                     \
-    //   sink receivers           aggregator receivers
-    //
-    // This avoids trying to clone UnboundedReceiver.
-    // ---------------------
-
     // inbound channels that sources will send into
     let (tx_snap_in, mut rx_snap_in) = mpsc::unbounded_channel::<OrderBookSnapshot>();
     let (tx_tr_in, mut rx_tr_in) = mpsc::unbounded_channel::<TradePrint>();
@@ -80,14 +68,18 @@ async fn main() -> Result<()> {
     let (tx_snap_agg, rx_snap_agg) = mpsc::unbounded_channel::<OrderBookSnapshot>();
     let (tx_tr_agg, rx_tr_agg) = mpsc::unbounded_channel::<TradePrint>();
 
-    // Spawn small duplicators: inbound -> (sink + agg)
     // snapshots duplicator
     {
         let tx_snap_sink_clone = tx_snap_sink.clone();
         let tx_snap_agg_clone = tx_snap_agg.clone();
         tokio::spawn(async move {
             while let Some(snap) = rx_snap_in.recv().await {
-                // best-effort forward to sink and aggregator
+                // targeted trace for binance/BTCUSDT
+                if snap.exchange.eq_ignore_ascii_case("binance")
+                    && snap.asset.eq_ignore_ascii_case("BTCUSDT")
+                {
+                    tracing::trace!(exchange=%snap.exchange, asset=%snap.asset, ts=%snap.ts_ms, "duplicator: forwarding snapshot");
+                }
                 let _ = tx_snap_sink_clone.send(snap.clone());
                 let _ = tx_snap_agg_clone.send(snap);
             }
@@ -101,6 +93,11 @@ async fn main() -> Result<()> {
         let tx_tr_agg_clone = tx_tr_agg.clone();
         tokio::spawn(async move {
             while let Some(tr) = rx_tr_in.recv().await {
+                if tr.exchange.eq_ignore_ascii_case("binance")
+                    && tr.asset.eq_ignore_ascii_case("BTCUSDT")
+                {
+                    tracing::trace!(exchange=%tr.exchange, asset=%tr.asset, ts=%tr.ts_ms, "duplicator: forwarding trade");
+                }
                 let _ = tx_tr_sink_clone.send(tr.clone());
                 let _ = tx_tr_agg_clone.send(tr);
             }
@@ -118,18 +115,12 @@ async fn main() -> Result<()> {
 
     // 5b) Spawn Binance feeds if configured - also point at inbound senders
     if let Some(bin_cfg) = &cfg.binance {
-        // spawn_binance_from_config is expected to spawn its own tasks and return quickly.
         spawn_binance_from_config(&cfg, bin_cfg, tx_snap_in.clone(), tx_tr_in.clone()).await?;
     }
 
     // 6) Attach sinks → writer (sink receivers)
     spawn_snapshot_sink(&cfg, rx_snap_sink, tx_writer.clone());
     spawn_trade_sink(&cfg, rx_tr_sink, tx_writer.clone());
-    // combined ticks are optional; if you have a combined tick generator, hook it here.
-    if cfg.mode.enable_combined_ticks {
-        // if user later adds spawn_combined_sink in sinks.rs, they'd wire it in here.
-        tracing::info!("combined tick emit enabled, but no combined sink was wired at startup");
-    }
 
     // 7) Aggregator — produce a GlobalOrderBook record on updates (uses aggregator-facing receivers)
     aggregator::spawn_aggregator(&cfg, rx_snap_agg, rx_tr_agg, tx_writer.clone());

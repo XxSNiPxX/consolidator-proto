@@ -1,24 +1,18 @@
-// reader.js
-// Usage examples:
-//   node reader.js ./data/global.mm
-//   node reader.js --show=trades ./data/global.mm
-//   node reader.js --show=trades --exchange=deribit --symbol=BTC-PERPETUAL --pretty ./data/global.mm
-//
-// show options: trades | books | combined | gob | gobjson | both | all | none
-// This reader tries bincode decodes first (matching the Rust writer) and falls back to
-// JSON parsing (Binance/Deribit-friendly) when decoding fails. Filters are case-insensitive
-// and symbols are normalized for flexible matching.
+#!/usr/bin/env node
+// reader.js — full self-contained version with watermark support
 
 const fs = require("fs");
 const mmap = require("@riaskov/mmap-io"); // npm i @riaskov/mmap-io
+const readline = require("readline");
 const argv = process.argv.slice(2);
 
-// CLI parsing (very small)
+// CLI parsing
 let FILE_PATH = "./data/global.mm";
 let SHOW = "both";
 let PRETTY = false;
 let FILTER_EXCHANGE = null;
 let FILTER_SYMBOL = null;
+let WATERMARK = 0; // default disabled
 
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -26,6 +20,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--pretty") PRETTY = true;
   else if (a.startsWith("--exchange=")) FILTER_EXCHANGE = argv[i].split("=")[1];
   else if (a.startsWith("--symbol=")) FILTER_SYMBOL = argv[i].split("=")[1];
+  else if (a.startsWith("--watermark="))
+    WATERMARK = parseInt(argv[i].split("=")[1], 10) || 0;
   else if (!a.startsWith("-") && i === argv.length - 1) FILE_PATH = a;
 }
 
@@ -58,7 +54,7 @@ const RTYPE = {
   5: "GlobalOrderBookJson",
 };
 
-/* binary helpers */
+/* --- Binary helpers --- */
 function u64(buf, o) {
   return [Number(buf.readBigUInt64LE(o)), o + 8];
 }
@@ -75,8 +71,9 @@ function f64(buf, o) {
   return [buf.readDoubleLE(o), o + 8];
 }
 
+/* Safe bincode-style string reader used by previous JS reader */
+/* bincode serializes a u64 length then that many bytes */
 function safeReadString(buf, o) {
-  // bincode encoded length (u64 little-endian) then UTF-8 bytes
   let len;
   [len, o] = u64(buf, o);
   if (!Number.isFinite(len) || len < 0 || Number(len) > buf.length - o) {
@@ -85,7 +82,6 @@ function safeReadString(buf, o) {
   const s = buf.subarray(o, o + Number(len)).toString("utf8");
   return [s, o + Number(len)];
 }
-
 function str(buf, o) {
   return safeReadString(buf, o);
 }
@@ -106,7 +102,7 @@ function optStr(buf, o) {
   return str(buf, o);
 }
 
-/* decoders — UPDATED to match Rust types order (exchange first) */
+/* --- Decoders matching Rust structs --- */
 function decodeBookSnapshot(buf) {
   // Rust OrderBookSnapshot: exchange: String, asset: String, kind: AssetKind, bid: f64, ask: f64, mid: f64, ts_ms: i64
   let o = 0;
@@ -153,7 +149,6 @@ function decodeCombinedTick(buf) {
   let ts_ms;
   [ts_ms, o] = i64(buf, o);
 
-  // spot (OrderBookSnapshot: exchange, asset, kind, bid, ask, mid, ts_ms)
   let s_exchange;
   [s_exchange, o] = str(buf, o);
   let s_asset;
@@ -169,7 +164,6 @@ function decodeCombinedTick(buf) {
   let s_ts;
   [s_ts, o] = i64(buf, o);
 
-  // fut
   let f_exchange;
   [f_exchange, o] = str(buf, o);
   let f_asset;
@@ -218,6 +212,7 @@ function decodeCombinedTick(buf) {
   };
 }
 
+/* Read Envelope */
 function readEnvelope(buf, off) {
   const rtype = buf.readUInt16LE(off + 0);
   const flags = buf.readUInt16LE(off + 2);
@@ -229,6 +224,7 @@ function readEnvelope(buf, off) {
   return { rtype, flags, ts_ms, src_id, inst_id, len, pad };
 }
 
+/* ASCII substring helper for debugging unknown payloads */
 function findAsciiSubstrings(payload) {
   const s = payload.toString("latin1");
   const regex = /[ -~]{3,}/g;
@@ -241,8 +237,7 @@ function findAsciiSubstrings(payload) {
   return res;
 }
 
-/* --- Helpers for resilient JSON parsing (Binance/Deribit-friendly) --- */
-
+/* JSON resilient parsing helpers (tries to extract book/trade-like objects) */
 function tryParseJson(buf) {
   try {
     const s = buf.toString("utf8");
@@ -263,19 +258,11 @@ function normalizeSymbol(s) {
     .replace(/[^A-Z0-9]/g, "");
 }
 
-/**
- * Attempt to extract a trade-like object from arbitrary JSON.
- * Looks for Binance p/q or generic price/qty fields.
- */
 function tryParseJsonToTrade(buf) {
   const js = tryParseJson(buf);
   if (!js) return null;
-
-  // Deribit subscription payload wrapping (common)
-  // Deribit combined: { "jsonrpc":"2.0","method":"subscription","params":{ "channel":"book.X", "data":{...}}}
   const core =
     js.params && js.params.data ? js.params.data : js.data ? js.data : js;
-
   let px = null,
     sz = null,
     side = null,
@@ -285,31 +272,24 @@ function tryParseJsonToTrade(buf) {
 
   if ("p" in core) px = Number(core.p);
   if ("price" in core) px = Number(core.price);
-  if ("price" in core && typeof core.price === "string")
-    px = Number(core.price);
-
   if ("q" in core) sz = Number(core.q);
   if ("qty" in core) sz = Number(core.qty);
   if ("size" in core) sz = Number(core.size);
   if ("quantity" in core) sz = Number(core.quantity);
 
-  // Binance: "m" boolean (is buyer maker) — map to side conservatively
-  if ("m" in core && typeof core.m === "boolean") {
-    side = core.m === false ? "Buy" : "Sell"; // common mapping
-  }
+  if ("m" in core && typeof core.m === "boolean")
+    side = core.m === false ? "Buy" : "Sell";
   if ("side" in core) side = String(core.side);
   if ("S" in core)
     side =
       core.S === "BUY" ? "Buy" : core.S === "SELL" ? "Sell" : String(core.S);
 
-  // timestamps
   if ("E" in core) ts = Number(core.E);
   if ("T" in core) ts = Number(core.T);
   if ("ts" in core) ts = Number(core.ts);
   if ("timestamp" in core) ts = Number(core.timestamp);
   if ("time" in core) ts = Number(core.time);
 
-  // symbol/exchange
   if ("s" in core) symbol = core.s;
   if ("symbol" in core) symbol = core.symbol;
   if ("instrument_name" in core) symbol = core.instrument_name;
@@ -327,20 +307,14 @@ function tryParseJsonToTrade(buf) {
       raw: core,
     };
   }
-
   return null;
 }
 
-/**
- * Attempt to extract a book-like object from arbitrary JSON.
- */
 function tryParseJsonToBook(buf) {
   const js = tryParseJson(buf);
   if (!js) return null;
-
   const core =
     js.params && js.params.data ? js.params.data : js.data ? js.data : js;
-
   let bid = null,
     ask = null,
     mid = null,
@@ -392,7 +366,7 @@ function tryParseJsonToBook(buf) {
   return null;
 }
 
-/* main */
+/* --- Main loop --- */
 (function main() {
   const fd = fs.openSync(FILE_PATH, "r");
   const stat = fs.fstatSync(fd);
@@ -411,10 +385,9 @@ function tryParseJsonToBook(buf) {
     `[mmap-reader] mapped ${FILE_PATH} (${size} bytes), starting at ${HEADER_SIZE}`,
   );
   console.log(
-    `[mmap-reader] SHOW=${SHOW} PRETTY=${PRETTY} EXCHANGE=${FILTER_EXCHANGE || "<any>"} SYMBOL=${FILTER_SYMBOL || "<any>"}`,
+    `[mmap-reader] SHOW=${SHOW} PRETTY=${PRETTY} EXCHANGE=${FILTER_EXCHANGE || "<any>"} SYMBOL=${FILTER_SYMBOL || "<any>"} WATERMARK=${WATERMARK}`,
   );
 
-  // normalize filters for robust matching:
   const normFilterExchange = FILTER_EXCHANGE
     ? normalizeExchangeName(FILTER_EXCHANGE)
     : null;
@@ -446,7 +419,6 @@ function tryParseJsonToBook(buf) {
   function passesFilters(decoded) {
     if (!decoded) return true;
 
-    // find exchange & symbol in various plausible places
     let ex =
       decoded.exchange ||
       (decoded.spot && decoded.spot.exchange) ||
@@ -454,6 +426,7 @@ function tryParseJsonToBook(buf) {
       (decoded.data && decoded.data.exchange) ||
       (decoded.raw && decoded.raw.exchange) ||
       null;
+
     let asset =
       decoded.asset ||
       decoded.symbol ||
@@ -491,9 +464,107 @@ function tryParseJsonToBook(buf) {
     return true;
   }
 
-  function output(obj) {
-    if (PRETTY) console.log(JSON.stringify(obj, null, 2));
-    else console.log(JSON.stringify(obj));
+  // dedupe by envelope key (rtype:ts:src:inst:pad)
+  let lastSeenKey = null;
+  let lastMid = null;
+  let maxSeenSeq = 0; // watermark highest seq seen
+
+  function compactLineFor(obj) {
+    try {
+      const env = obj.envelope || {};
+      const data = obj.data || {};
+      const exchange =
+        data.exchange || (data.spot && data.spot.exchange) || "<unknown>";
+      const asset =
+        data.asset ||
+        (data.spot && data.spot.asset) ||
+        (data.raw && (data.raw.s || data.raw.symbol)) ||
+        "<unknown>";
+      let bid = data.bid,
+        ask = data.ask,
+        mid = data.mid;
+      if (mid == null && typeof bid === "number" && typeof ask === "number")
+        mid = (bid + ask) / 2;
+      if (mid == null && typeof data.px === "number") mid = data.px;
+
+      const ts =
+        env.ts_ms ||
+        data.ts_ms ||
+        (data.raw && (data.raw.E || data.raw.T || data.raw.ts)) ||
+        null;
+      const seq = env.pad || (env.pad === 0 ? 0 : null);
+
+      const deltaMid =
+        typeof mid === "number" && typeof lastMid === "number"
+          ? mid - lastMid
+          : null;
+
+      function nf(x) {
+        if (x == null) return "-";
+        if (Number.isInteger(x)) return String(x);
+        return Number.parseFloat(x)
+          .toFixed(6)
+          .replace(/\.?0+$/, "");
+      }
+
+      const kind = env.kind || (obj.__rtype ? obj.__rtype : "");
+      const src = `src=${env.src_id || "?"} inst=${env.inst_id || "?"} seq=${seq === null ? "?" : seq}`;
+      let pieces = [
+        `${exchange}`,
+        `${asset}`,
+        kind ? `(${kind})` : "",
+        `bid:${nf(bid)}`,
+        `ask:${nf(ask)}`,
+        `mid:${nf(mid)}`,
+        `ts:${ts || "-"}`,
+        src,
+      ];
+      if (deltaMid !== null)
+        pieces.push(`Δmid:${(deltaMid >= 0 ? "+" : "") + nf(deltaMid)}`);
+      return pieces.filter(Boolean).join(" ");
+    } catch (e) {
+      return "[compact-line-error]";
+    }
+  }
+
+  function updateSingleLine(obj) {
+    const line = compactLineFor(obj);
+    readline.clearLine(process.stdout, 0);
+    readline.cursorTo(process.stdout, 0);
+    process.stdout.write(line);
+  }
+
+  function shouldSkipByWatermark(env) {
+    if (!env || typeof env.pad !== "number") return false;
+    const seq = env.pad;
+    if (!seq || seq <= 0) return false;
+    if (!WATERMARK || WATERMARK <= 0) return false;
+    if (seq <= maxSeenSeq - WATERMARK) return true;
+    return false;
+  }
+
+  function output(obj, rtype, env) {
+    const ts =
+      env && env.ts_ms
+        ? env.ts_ms.toString()
+        : obj && obj.data && obj.data.ts_ms
+          ? String(obj.data.ts_ms)
+          : null;
+    const key = `${rtype || "?"}:${ts || "?"}:${env ? env.src_id : "?"}:${env ? env.inst_id : "?"}:${env ? env.pad : "?"}`;
+    if (key === lastSeenKey) return;
+
+    if (shouldSkipByWatermark(env)) return;
+
+    if (obj && obj.data) {
+      if (typeof obj.data.mid === "number") lastMid = obj.data.mid;
+      else if (typeof obj.data.px === "number") lastMid = obj.data.px;
+    }
+
+    if (env && typeof env.pad === "number" && env.pad > maxSeenSeq)
+      maxSeenSeq = env.pad;
+
+    lastSeenKey = key;
+    updateSingleLine(obj);
   }
 
   function step() {
@@ -521,39 +592,38 @@ function tryParseJsonToBook(buf) {
         envA.len === envB.len &&
         envA.ts_ms === envB.ts_ms &&
         envA.src_id === envB.src_id &&
-        envA.inst_id === envB.inst_id;
+        envA.inst_id === envB.inst_id &&
+        envA.pad === envB.pad;
 
       if (!valid || !stable) return setImmediate(step);
 
       const rtype = envB.rtype;
-      const kind = RTYPE[rtype] || `Unknown(${rtype})`;
 
       try {
         if (rtype === 2) {
-          // Trade
           let decoded;
           try {
             decoded = decodeTradePrint(payload);
           } catch (e) {
-            // fallback to JSON parsing (Binance/Deribit-friendly)
             const alt = tryParseJsonToTrade(payload);
             if (alt) decoded = alt;
             else decoded = { decode_error: e.message };
           }
           if (shouldPrint("trade", decoded) && passesFilters(decoded)) {
-            output({
+            const obj = {
               envelope: {
-                kind,
+                kind: RTYPE[rtype],
                 ts_ms: envB.ts_ms.toString(),
                 src_id: envB.src_id,
                 inst_id: envB.inst_id,
                 len: envB.len,
+                pad: envB.pad,
               },
               data: decoded,
-            });
+            };
+            output(obj, "trade", obj.envelope);
           }
         } else if (rtype === 1) {
-          // Book snapshot
           let decoded;
           try {
             decoded = decodeBookSnapshot(payload);
@@ -563,19 +633,20 @@ function tryParseJsonToBook(buf) {
             else decoded = { decode_error: e.message };
           }
           if (shouldPrint("book", decoded) && passesFilters(decoded)) {
-            output({
+            const obj = {
               envelope: {
-                kind,
+                kind: RTYPE[rtype],
                 ts_ms: envB.ts_ms.toString(),
                 src_id: envB.src_id,
                 inst_id: envB.inst_id,
                 len: envB.len,
+                pad: envB.pad,
               },
               data: decoded,
-            });
+            };
+            output(obj, "book", obj.envelope);
           }
         } else if (rtype === 3) {
-          // CombinedTick
           let decoded;
           try {
             decoded = decodeCombinedTick(payload);
@@ -583,33 +654,36 @@ function tryParseJsonToBook(buf) {
             decoded = { decode_error: e.message };
           }
           if (shouldPrint("combined", decoded) && passesFilters(decoded)) {
-            output({
+            const obj = {
               envelope: {
-                kind,
+                kind: RTYPE[rtype],
                 ts_ms: envB.ts_ms.toString(),
                 src_id: envB.src_id,
                 inst_id: envB.inst_id,
                 len: envB.len,
+                pad: envB.pad,
               },
               data: decoded,
-            });
+            };
+            output(obj, "combined", obj.envelope);
           }
         } else if (rtype === 5) {
-          // GlobalOrderBookJson
           try {
             const txt = payload.toString("utf8");
             const js = JSON.parse(txt);
             if (shouldPrint("gobjson", js) && passesFilters(js)) {
-              output({
+              const obj = {
                 envelope: {
                   kind: "GlobalOrderBookJson",
                   ts_ms: envB.ts_ms.toString(),
                   src_id: envB.src_id,
                   inst_id: envB.inst_id,
                   len: envB.len,
+                  pad: envB.pad,
                 },
                 data: js,
-              });
+              };
+              output(obj, "gobjson", obj.envelope);
             }
           } catch (e) {
             const ascii = findAsciiSubstrings(payload);
@@ -620,11 +694,13 @@ function tryParseJsonToBook(buf) {
                 src_id: envB.src_id,
                 inst_id: envB.inst_id,
                 len: envB.len,
+                pad: envB.pad,
               },
               ascii_snippets: ascii,
               raw_head_b64: payload.subarray(0, 256).toString("base64"),
             };
-            if (shouldPrint("gobjson", obj) && passesFilters(obj)) output(obj);
+            if (shouldPrint("gobjson", obj) && passesFilters(obj))
+              output(obj, "gobjson", obj.envelope);
           }
         } else if (rtype === 4) {
           const ascii = findAsciiSubstrings(payload);
@@ -635,25 +711,28 @@ function tryParseJsonToBook(buf) {
               src_id: envB.src_id,
               inst_id: envB.inst_id,
               len: envB.len,
+              pad: envB.pad,
             },
             ascii_snippets: ascii,
             raw_head_b64: payload.subarray(0, 256).toString("base64"),
           };
-          if (shouldPrint("gob", obj) && passesFilters(obj)) output(obj);
+          if (shouldPrint("gob", obj) && passesFilters(obj))
+            output(obj, "gob", obj.envelope);
         } else {
           const ascii = findAsciiSubstrings(payload);
           const obj = {
             envelope: {
-              kind,
+              kind: RTYPE[rtype] || `Unknown(${rtype})`,
               ts_ms: envB.ts_ms.toString(),
               src_id: envB.src_id,
               inst_id: envB.inst_id,
               len: envB.len,
+              pad: envB.pad,
             },
             ascii_snippets: ascii,
             raw_head_b64: payload.subarray(0, 128).toString("base64"),
           };
-          if (SHOW !== "none") output(obj);
+          if (SHOW !== "none") output(obj, "unknown", obj.envelope);
         }
       } catch (e) {
         console.error("[reader] decode error:", e.stack || e.message);

@@ -1,5 +1,5 @@
 // src/sources_binance.rs
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,8 +16,6 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Spawn Binance connections according to `bin_cfg`.
-/// This returns quickly after spawning tasks; tasks run forever (reconnect loops internally).
 pub async fn spawn_binance_from_config(
     _cfg: &AppConfig,
     bin_cfg: &BinanceSources,
@@ -26,7 +24,6 @@ pub async fn spawn_binance_from_config(
 ) -> Result<()> {
     let ws_url = bin_cfg.ws_url.clone();
 
-    // spawn books connection if any
     if !bin_cfg.books.is_empty() {
         let books = bin_cfg.books.clone();
         let tx_snap_clone = tx_snap.clone();
@@ -38,7 +35,6 @@ pub async fn spawn_binance_from_config(
         });
     }
 
-    // spawn trades connection if any
     if !bin_cfg.trades.is_empty() {
         let trades = bin_cfg.trades.clone();
         let tx_tr_clone = tx_tr.clone();
@@ -53,13 +49,8 @@ pub async fn spawn_binance_from_config(
     Ok(())
 }
 
-/// Connect to Binance combined `bookTicker` streams and emit OrderBookSnapshot for each symbol.
-/// This function will never return unless the spawn task is cancelled; it reconnects in a loop.
-// helper: normalize a configured ws_url to a base (no /ws or /stream path)
 fn normalize_binance_base(ws_url: &str) -> String {
-    // trim trailing slashes
     let mut s = ws_url.trim_end_matches('/').to_string();
-    // remove trailing "/ws" or "/stream" if present so we can append "/stream?streams=" safely
     if s.ends_with("/ws") {
         s.truncate(s.len() - "/ws".len());
     } else if s.ends_with("/stream") {
@@ -84,11 +75,9 @@ async fn run_binance_book_stream(
         .collect();
     let streams_joined = stream_names.join("/");
 
-    // normalize base
     let base = normalize_binance_base(&ws_url);
 
     loop {
-        // Use combined-stream endpoint explicitly
         let url = format!("{}/stream?streams={}", base, streams_joined);
         tracing::info!(target: "binance", "connecting book stream: {}", url);
 
@@ -96,8 +85,6 @@ async fn run_binance_book_stream(
             Ok((ws_stream, _resp)) => {
                 tracing::info!(target: "binance", "book stream connected");
                 let (mut write, mut read) = ws_stream.split();
-
-                // ... (rest unchanged) ...
                 let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
 
                 loop {
@@ -116,7 +103,6 @@ async fn run_binance_book_stream(
                             };
                             match msg {
                                 Ok(Message::Text(txt)) => {
-                                    // same parsing as before...
                                     if let Ok(v) = serde_json::from_str::<Value>(&txt) {
                                         if let Some(data) = v.get("data") {
                                             if let Some(sym) = data.get("s").and_then(|x| x.as_str()) {
@@ -127,17 +113,22 @@ async fn run_binance_book_stream(
                                                     let mid = 0.5*(bid+ask);
                                                     let snap = OrderBookSnapshot {
                                                         exchange: "binance".to_string(),
-                                                        asset: sym.to_string(),
+                                                        asset: sym.to_uppercase(),
                                                         kind: AssetKind::Spot,
                                                         bid,
                                                         ask,
                                                         mid,
                                                         ts_ms: ts,
                                                     };
-                                                    let _ = tx_snap.send(snap);
+                                                    if tx_snap.send(snap).is_err() {
+                                                        tracing::warn!(target:"binance","tx_snap closed; stopping book stream");
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
+                                    } else {
+                                        tracing::debug!(target:"binance","book text not JSON: {}", txt);
                                     }
                                 }
                                 Ok(Message::Close(_)) => {
@@ -158,7 +149,6 @@ async fn run_binance_book_stream(
                 continue;
             }
             Err(e) => {
-                // log the error (this will include Http(Response ...) you saw)
                 tracing::warn!(target: "binance", "failed to connect book stream: {:?}; retrying in 1s", e);
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
@@ -183,7 +173,6 @@ async fn run_binance_trade_stream(
         .collect();
     let streams_joined = stream_names.join("/");
 
-    // normalize base
     let base = normalize_binance_base(&ws_url);
 
     loop {
@@ -194,7 +183,6 @@ async fn run_binance_trade_stream(
             Ok((ws_stream, _resp)) => {
                 tracing::info!(target: "binance", "trades stream connected");
                 let (mut write, mut read) = ws_stream.split();
-
                 let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
 
                 loop {
@@ -211,7 +199,6 @@ async fn run_binance_trade_stream(
                                 tracing::warn!(target:"binance","trade stream ended, reconnecting");
                                 break;
                             };
-
                             match msg {
                                 Ok(Message::Text(txt)) => {
                                     if let Ok(v) = serde_json::from_str::<Value>(&txt) {
@@ -224,17 +211,22 @@ async fn run_binance_trade_stream(
                                                 if px.is_finite() && sz > 0.0 {
                                                     let tp = TradePrint {
                                                         exchange: "binance".to_string(),
-                                                        asset: sym.to_string(),
+                                                        asset: sym.to_uppercase(),
                                                         kind: AssetKind::Spot,
                                                         px,
                                                         sz,
                                                         side,
                                                         ts_ms: ts,
                                                     };
-                                                    let _ = tx_tr.send(tp);
+                                                    if tx_tr.send(tp).is_err() {
+                                                        tracing::warn!(target:"binance","tx_tr closed; stopping trade stream");
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
+                                    } else {
+                                        tracing::debug!(target:"binance","trade text not JSON: {}", txt);
                                     }
                                 }
                                 Ok(Message::Close(_)) => {

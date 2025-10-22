@@ -1,3 +1,4 @@
+// src/sinks.rs
 use crate::config::AppConfig;
 use crate::mmap_writer::WriterMsg;
 use crate::types::{OrderBookSnapshot, TradePrint};
@@ -5,6 +6,17 @@ use crate::writer_envelope::RType;
 use anyhow::Result;
 use bincode;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use once_cell::sync::Lazy;
+
+/// Global monotonic sequence used to debug ordering / detect wrap/overwrite.
+/// Stored into Envelope.pad when building envelopes.
+static GLOBAL_SEQ: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(1));
+
+fn next_seq() -> u32 {
+    GLOBAL_SEQ.fetch_add(1, Ordering::SeqCst)
+}
 
 /// Spawn a sink that listens for snapshots and forwards them to the writer.
 pub fn spawn_snapshot_sink(
@@ -18,7 +30,7 @@ pub fn spawn_snapshot_sink(
             match bincode::serialize(&snap) {
                 Ok(payload) => {
                     // Build envelope using catalog if available (best-effort)
-                    let env = crate::sinks::make_env_from_cfg(
+                    let mut env = crate::sinks::make_env_from_cfg(
                         &cfg,
                         "book",
                         &snap.exchange,
@@ -27,8 +39,11 @@ pub fn spawn_snapshot_sink(
                         snap.ts_ms,
                         payload.len(),
                     );
+                    // stamp monotonic seq for debugging in pad field
+                    env.pad = next_seq();
+
                     // log for debugging
-                    tracing::debug!(exchange=%snap.exchange, asset=%snap.asset, "snapshot -> writer len={}", payload.len());
+                    tracing::debug!(exchange=%snap.exchange, asset=%snap.asset, "snapshot -> writer len={} ts={} seq={}", payload.len(), snap.ts_ms, env.pad);
                     if let Err(e) = txw.send(WriterMsg { env, payload }).await {
                         tracing::warn!("snapshot_sink: tx_writer send failed: {:?}", e);
                         break;
@@ -55,7 +70,7 @@ pub fn spawn_trade_sink(
         while let Some(tr) = rx.recv().await {
             match bincode::serialize(&tr) {
                 Ok(payload) => {
-                    let env = crate::sinks::make_env_from_cfg(
+                    let mut env = crate::sinks::make_env_from_cfg(
                         &cfg,
                         "trades",
                         &tr.exchange,
@@ -64,7 +79,9 @@ pub fn spawn_trade_sink(
                         tr.ts_ms,
                         payload.len(),
                     );
-                    tracing::debug!(exchange=%tr.exchange, asset=%tr.asset, px=%tr.px, "trade -> writer len={}", payload.len());
+                    env.pad = next_seq();
+
+                    tracing::debug!(exchange=%tr.exchange, asset=%tr.asset, px=%tr.px, "trade -> writer len={} ts={} seq={}", payload.len(), tr.ts_ms, env.pad);
                     if let Err(e) = txw.send(WriterMsg { env, payload }).await {
                         tracing::warn!("trade_sink: tx_writer send failed: {:?}", e);
                         break;
@@ -111,6 +128,6 @@ pub fn make_env_from_cfg(
         src_id,
         inst_id,
         len: payload_len as u32,
-        pad: 0,
+        pad: 0, // overwritten by caller via next_seq()
     }
 }

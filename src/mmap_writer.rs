@@ -105,8 +105,12 @@ impl GlobalWriter {
         // Acquire offset
         let mut off = *self.write_offset.lock();
 
+        // trace before wrap so we can see where we started writing from
+        tracing::trace!(target: "mmap_writer", "append start: off={} total_len={} header_size={} file_len={} seq={}", off, total_len, self.header_size, self.file_len, env.pad);
+
         // wrap if not enough space until end-of-file
         if off + total_len > self.file_len {
+            tracing::trace!(target: "mmap_writer", "append wrapping: off={} -> header_size={}", off, self.header_size);
             off = self.header_size;
         }
 
@@ -136,11 +140,15 @@ impl GlobalWriter {
         let new_off = off + total_len;
         *self.write_offset.lock() = new_off;
         self.bytes_since_flush += total_len;
+
+        tracing::trace!(target: "mmap_writer", "append wrote: seq={} off={} total_len={} new_off={}", env.pad, off, total_len, new_off);
+
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
         self.mmap.flush_async()?;
+        tracing::trace!(target: "mmap_writer", "flush: write_offset={} bytes_since_flush={}", *self.write_offset.lock(), self.bytes_since_flush);
         self.bytes_since_flush = 0;
         Ok(())
     }
